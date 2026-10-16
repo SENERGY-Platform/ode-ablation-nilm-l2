@@ -6,9 +6,10 @@
 name: ode-ablation-nilm-l2
 description: >
   Estimates the heat pump compressor's 15-minute mean electrical power in watts
-  from the site's main meter energy register (transformer factor applied), with the
-  EV charging socket's energy register as a covariate. One estimate per bucket,
-  stamped with the bucket start, published 30 minutes after the bucket ends.
+  from the site's main meter energy register (transformer factor applied), with
+  outdoor temperature and, optionally, the EV charging socket's energy register as
+  covariates. One estimate per bucket, stamped with the bucket start, published
+  30 minutes after the bucket ends.
 image: ghcr.io/senergy-platform/ode-ablation-nilm-l2:latest
 
 # Public makes the operator visible to other users of the platform. Registration
@@ -22,6 +23,8 @@ inputs:
   - name: main_energy
     type: float
   - name: ev_energy
+    type: float
+  - name: temperature
     type: float
 
 # What the operator emits. These are the keys of the dictionary infer() returns.

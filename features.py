@@ -12,10 +12,15 @@ step lands between two consecutive samples, so placing it at their midpoint and
 interpolating linearly between steps recovers the energy at any instant to well
 under one step. Every power below is read off that curve.
 
+Outdoor temperature (open-meteo history, hourly, stamped with the hour it describes)
+is the one covariate that changes from one winter day to the next and drives the
+compressor's duty cycle. Two features come from it, both as of the bucket's end: the
+latest hourly value, and the mean over the trailing 24 hours.
+
 build_features computes the feature rows for any set of bucket starts from raw
-samples. Training calls it over a year of history, infer() over a few hours of
-buffered messages for one bucket at a time: the same code on both paths, so the
-model never sees a feature at inference that was computed differently in training.
+samples. Training calls it over a year of history, infer() over buffered messages for
+one bucket at a time: the same code on both paths, so the model never sees a feature
+at inference that was computed differently in training.
 
 Buckets are fixed 15-minute intervals truncated from the Unix epoch in UTC, which is
 how Operator Lib's scorer buckets both the target and a prediction's result time.
@@ -47,6 +52,13 @@ MAIN_MAX_KW = 400.0
 MAIN_DROP_TOL = 0.5
 EV_MAX_KW = 30.0
 EV_DROP_TOL = 0.05
+
+# Temperature: the trailing window of the mean, and how old the latest value may be
+# before it counts as missing rather than current.
+TEMP_MEAN_S = 24 * 3600
+TEMP_MAX_AGE_S = 3 * 3600
+# How much temperature history infer() keeps.
+TEMP_KEEP_S = TEMP_MEAN_S + 2 * 3600
 
 _FIRST = -CONTEXT_BUCKETS * BUCKET_S
 _LAST = (1 + LOOKAHEAD_BUCKETS) * BUCKET_S
@@ -123,11 +135,38 @@ def _nan(fn, a, axis):
         return fn(a, axis=axis)
 
 
-def build_features(main_ts, main_vs, ev_ts, ev_vs, starts) -> pd.DataFrame:
+def _temperature(temp_ts, temp_vs, at: np.ndarray):
+    """Latest value at or before `at` (missing if older than TEMP_MAX_AGE_S), and the
+    mean of the values in (at - TEMP_MEAN_S, at]."""
+    ts = np.asarray(temp_ts if temp_ts is not None else [], dtype=float)
+    vs = np.asarray(temp_vs if temp_vs is not None else [], dtype=float)
+    ok = np.isfinite(ts) & np.isfinite(vs)
+    ts, vs = ts[ok], vs[ok]
+    now = np.full(at.shape, np.nan)
+    mean = np.full(at.shape, np.nan)
+    if len(ts) == 0:
+        return now, mean
+    order = np.argsort(ts, kind="stable")
+    ts, vs = ts[order], vs[order]
+    hi = np.searchsorted(ts, at, side="right")
+    lo = np.searchsorted(ts, at - TEMP_MEAN_S, side="right")
+    last = hi - 1
+    has = last >= 0
+    fresh = has & ((at - ts[np.maximum(last, 0)]) <= TEMP_MAX_AGE_S)
+    now[fresh] = vs[last[fresh]]
+    csum = np.concatenate([[0.0], np.cumsum(vs)])
+    count = hi - lo
+    filled = count > 0
+    mean[filled] = (csum[hi[filled]] - csum[lo[filled]]) / count[filled]
+    return now, mean
+
+
+def build_features(main_ts, main_vs, ev_ts, ev_vs, starts, temp_ts=None, temp_vs=None) -> pd.DataFrame:
     """One feature row per bucket start (Unix seconds, multiples of BUCKET_S).
 
     main_*: the main meter's factored register, kWh. ev_*: the EV socket's energy
-    register, kWh, or empty arrays when there is none.
+    register, kWh, or empty arrays when there is none. temp_*: outdoor temperature,
+    degrees C, stamped with the hour it describes, or None.
     """
     starts = np.asarray(starts, dtype=float)
     pts = starts[:, None] + GRID[None, :]
@@ -170,6 +209,10 @@ def build_features(main_ts, main_vs, ev_ts, ev_vs, starts) -> pd.DataFrame:
     f["R"] = R
     f["R_minus_min_past"] = R - _nan(np.nanmin, r15[:, :_B0], 1)
     f["R_minus_median_ctx"] = R - _nan(np.nanmedian, r15, 1)
+
+    t_now, t_mean = _temperature(temp_ts, temp_vs, starts + BUCKET_S)
+    f["temp_now"] = t_now
+    f["temp_24h"] = t_mean
 
     local = pd.to_datetime(starts, unit="s", utc=True).tz_convert(LOCAL_TZ)
     f["hour"] = (local.hour + local.minute / 60.0).to_numpy(dtype=float)

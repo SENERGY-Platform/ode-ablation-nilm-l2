@@ -3,9 +3,9 @@
 Inputs, by selector:
   main  -- main_energy: the main meter's register obis_1_8_0_f, kWh on the primary
            side (transformer factor 50 applied by the meter's own firmware).
-  ev    -- ev_energy: the EV charging socket's energy register, kWh. A covariate: the
-           socket draws about as much as the compressor and would otherwise be
-           mistaken for it.
+  ev    -- ev_energy: the EV charging socket's energy register, kWh. Optional.
+  temp  -- temperature: outdoor temperature, degrees C, hourly, stamped with the hour
+           it describes (open-meteo history import). Optional.
 
 Output: {"prediction": W}, one per 15-minute bucket, stamped with the bucket's start.
 An estimate is published once a main-meter sample has arrived LOOKAHEAD_BUCKETS
@@ -30,7 +30,7 @@ from training import train_model
 
 
 class CustomConfig(Config):
-    # Retrain at most this often, in seconds. A training pass reads a year of three
+    # Retrain at most this often, in seconds. A training pass reads a year of several
     # series, so weekly rather than daily.
     retrain_after_s = 7 * 86400
 
@@ -58,6 +58,11 @@ def _prune(ts: typing.List[float], vs: typing.List[float], cutoff: float):
     return [ts[k] for k in keep] + ts[i:], [vs[k] for k in keep] + vs[i:]
 
 
+def _prune_plain(ts: typing.List[float], vs: typing.List[float], cutoff: float):
+    i = bisect.bisect_left(ts, cutoff)
+    return ts[i:], vs[i:]
+
+
 def _append(ts: typing.List[float], vs: typing.List[float], t: float, v: float):
     if not ts or t > ts[-1]:
         ts.append(t)
@@ -79,6 +84,7 @@ class Operator(MLOperator):
     selectors = [
         Selector({"name": "main", "args": ["main_energy"]}),
         Selector({"name": "ev", "args": ["ev_energy"]}),
+        Selector({"name": "temp", "args": ["temperature"]}),
     ]
 
     def init(self, *args, **kwargs):
@@ -90,6 +96,8 @@ class Operator(MLOperator):
         self.main_v: typing.List[float] = []
         self.ev_t: typing.List[float] = []
         self.ev_v: typing.List[float] = []
+        self.temp_t: typing.List[float] = []
+        self.temp_v: typing.List[float] = []
         self.next_bucket: typing.Optional[float] = None
         super().init(*args, **kwargs)
 
@@ -109,6 +117,12 @@ class Operator(MLOperator):
             value = data.get("ev_energy")
             if value is not None:
                 _append(self.ev_t, self.ev_v, t, float(value))
+            return None, None, None
+
+        if selector == "temp":
+            value = data.get("temperature")
+            if value is not None:
+                _append(self.temp_t, self.temp_v, t, float(value))
             return None, None, None
 
         value = data.get("main_energy")
@@ -131,12 +145,15 @@ class Operator(MLOperator):
             np.asarray(self.main_t), np.asarray(self.main_v),
             np.asarray(self.ev_t), np.asarray(self.ev_v),
             np.array([start]),
+            np.asarray(self.temp_t), np.asarray(self.temp_v),
         )
         prediction = float(np.asarray(model.predict(X)).ravel()[0])
 
         cutoff = self.next_bucket - _KEEP_S
         self.main_t, self.main_v = _prune(self.main_t, self.main_v, cutoff)
         self.ev_t, self.ev_v = _prune(self.ev_t, self.ev_v, cutoff)
+        self.temp_t, self.temp_v = _prune_plain(
+            self.temp_t, self.temp_v, self.next_bucket + F.BUCKET_S - F.TEMP_KEEP_S)
 
         bucket_time = datetime.datetime.fromtimestamp(start, tz=datetime.timezone.utc)
         return bucket_time, {"prediction": prediction}, None

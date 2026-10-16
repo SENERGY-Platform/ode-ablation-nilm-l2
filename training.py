@@ -1,7 +1,8 @@
 """Training: disaggregate the heat pump compressor's 15-minute mean power from the main meter.
 
-Reads a year of the operator's inputs -- the main meter's factored energy register
-and the EV socket's energy register -- and, as a training-only topic, the compressor
+Reads a year of the operator's inputs -- the main meter's factored energy register,
+the EV socket's energy register where it is an input, and outdoor temperature from
+the open-meteo history import -- and, as a training-only topic, the compressor
 sub-meter's own power. The sub-meter is the label: it is read here and nowhere else,
 because the deployed operator never receives it.
 
@@ -111,7 +112,7 @@ def _local_hour(buckets) -> np.ndarray:
     return (local.hour + local.minute / 60.0).to_numpy(dtype=float)
 
 
-def build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs) -> pd.DataFrame:
+def build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs, temp_ts=None, temp_vs=None) -> pd.DataFrame:
     labels = F.bucket_means(label_ts, label_vs)
     labels = labels[labels["count"] >= MIN_LABEL_SAMPLES]
     if labels.empty or len(main_ts) == 0:
@@ -121,7 +122,7 @@ def build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs) -> pd.DataFr
     starts = labels.index.to_numpy(dtype=float)
     starts = starts[(starts >= lo) & (starts <= hi)]
     starts = starts[np.isin(_local(starts).month, HEATING_MONTHS)]
-    X = F.build_features(main_ts, main_vs, ev_ts, ev_vs, starts)
+    X = F.build_features(main_ts, main_vs, ev_ts, ev_vs, starts, temp_ts, temp_vs)
     X["bucket"] = starts
     X["target"] = labels.loc[starts, "mean"].to_numpy()
     X = X[(X["n_main"] >= MIN_MAIN_SAMPLES) & np.isfinite(X["P"])]
@@ -173,6 +174,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
 
     main_ts, main_vs = _series(_frame_with(inputs, "main_energy"), "main_energy")
     ev_ts, ev_vs = _series(_frame_with(inputs, "ev_energy"), "ev_energy")
+    temp_ts, temp_vs = _series(_frame_with(inputs, "temperature"), "temperature")
     label_ts, label_vs = _series(_frame_with(training, "target"), "target")
 
     logger.log_params({
@@ -187,6 +189,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     logger.log_metrics({
         "rows_main": float(len(main_ts)),
         "rows_ev": float(len(ev_ts)),
+        "rows_temp": float(len(temp_ts)),
         "rows_label": float(len(label_ts)),
     })
 
@@ -195,10 +198,11 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         return None
 
     with logger.trace("features"):
-        table = build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs)
+        table = build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs, temp_ts, temp_vs)
     if table.empty:
         return None
     columns = [c for c in table.columns if c not in ("bucket", "target")]
+    logger.log_metrics({"temp_coverage": float(np.isfinite(table["temp_now"]).mean())})
 
     split = table["bucket"].max() + F.BUCKET_S - VALIDATION.total_seconds()
     train_part = table[table["bucket"] < split].reset_index(drop=True)
