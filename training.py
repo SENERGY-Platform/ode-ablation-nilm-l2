@@ -40,9 +40,12 @@ from operator_lib.util.helpers import provide_historic_data_local, TrainMlflowLo
 import features as F
 
 
-# How much history one training pass reads. A year covers one full heating season
-# before the test window, including last February.
-TRAINING_WINDOW = datetime.timedelta(days=365)
+# How much history one training pass reads. 381 days reaches back to the main meter's
+# first data (2025-01-16 for a training end of 2026-02-01), so the second half of last
+# January -- the closest match to the months the operator is scored on -- is in the
+# training set. Every input either is a device topic or has an export, so no topic is
+# read from Kafka and its 365-day cap does not apply.
+TRAINING_WINDOW = datetime.timedelta(days=381)
 VALIDATION = datetime.timedelta(days=31)
 
 # Local months whose buckets become training rows.

@@ -34,12 +34,11 @@ import pandas as pd
 BUCKET_S = 900
 SUB_S = 300
 
-# Context the features look at: 6 h before the bucket, 30 min after it. Six hours
-# span several compressor cycles (roughly 60-90 min on, 15-45 min off), so the
-# context's minimum and median describe the site's base load under the compressor
-# rather than a single cycle. The look-ahead is why an estimate is published half an
-# hour after its bucket closes.
-CONTEXT_BUCKETS = 24
+# Context the features look at: 2 h before the bucket, 30 min after it. Six hours of
+# context was tried and was about 2 % worse on the January hold-out and on February
+# alike, with the same in-sample fit. The look-ahead is why an estimate is published
+# half an hour after its bucket closes.
+CONTEXT_BUCKETS = 8
 LOOKAHEAD_BUCKETS = 2
 
 # A bucket is computed once a main-meter sample this far past the end of its
