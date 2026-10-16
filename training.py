@@ -12,6 +12,13 @@ Before the final fit the last VALIDATION of history is held out, the model fitte
 what precedes it and scored there, and that score logged as val_mae. That is a check
 against data the session may read; the evaluation's own score over the test window is
 recorded separately by Operator Lib.
+
+The hold-out also carries a diagnostic that is independent of the model: how strongly
+the bucket-to-bucket change in main-meter power follows the change in compressor
+power, at lags of -4..+4 buckets. A compressor start or stop is a 3.3 kW step; if the
+main meter sees it, the correlation peaks at lag 0. A peak elsewhere is a time offset
+between the two meters, and no peak at all means the main meter does not carry the
+compressor visibly at this resolution.
 """
 
 import datetime
@@ -38,6 +45,9 @@ MIN_MAIN_SAMPLES = 5
 
 # What the compressor can draw, for clipping an estimate.
 P_MIN, P_MAX = -5.0, 4500.0
+
+# Lags, in buckets, of the step-correlation diagnostic.
+DIAGNOSTIC_LAGS = range(-4, 5)
 
 MODEL_PARAMS = dict(
     loss="absolute_error",
@@ -114,6 +124,32 @@ def _mae(model: CompressorPowerModel, X: pd.DataFrame) -> float:
     return float(np.mean(np.abs(model.predict(None, X) - X["target"].to_numpy())))
 
 
+def _lag_correlations(part: pd.DataFrame, prefix: str) -> typing.Dict[str, float]:
+    """Pearson correlation of d_prev (main power, this bucket minus the previous one)
+    with the same difference of the target, shifted by k buckets.
+
+    The target difference is taken only between buckets that are actually adjacent,
+    so a gap in the label never produces a spurious step. Lag k pairs the main-meter
+    step in bucket t with the compressor step in bucket t + k.
+    """
+    out: typing.Dict[str, float] = {}
+    if part.empty:
+        return out
+    target = pd.Series(part["target"].to_numpy(), index=part["bucket"].to_numpy())
+    d_target = target - target.reindex(target.index - F.BUCKET_S).to_numpy()
+    d_main = pd.Series(part["d_prev"].to_numpy(), index=part["bucket"].to_numpy())
+    for k in DIAGNOSTIC_LAGS:
+        shifted = d_target.reindex(d_main.index + k * F.BUCKET_S).to_numpy()
+        a, b = d_main.to_numpy(), shifted
+        ok = np.isfinite(a) & np.isfinite(b)
+        name = f"{prefix}_lag{k:+d}".replace("+", "p").replace("-", "m")
+        if ok.sum() < 30 or np.std(a[ok]) == 0 or np.std(b[ok]) == 0:
+            out[name] = float("nan")
+        else:
+            out[name] = float(np.corrcoef(a[ok], b[ok])[0, 1])
+    return out
+
+
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     with logger.trace("read history"):
         inputs = [ds.to_pandas() for ds in provide_historic_data_local(TRAINING_WINDOW)]
@@ -126,12 +162,15 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     logger.log_params({
         "training_window_days": TRAINING_WINDOW.days,
         "validation_days": VALIDATION.days,
-        "rows_main": int(len(main_ts)),
-        "rows_ev": int(len(ev_ts)),
-        "rows_label": int(len(label_ts)),
         "context_buckets": F.CONTEXT_BUCKETS,
         "lookahead_buckets": F.LOOKAHEAD_BUCKETS,
         **{f"hgb_{k}": v for k, v in MODEL_PARAMS.items()},
+    })
+    # Also as metrics: the run summary carries metrics, and these say what training saw.
+    logger.log_metrics({
+        "rows_main": float(len(main_ts)),
+        "rows_ev": float(len(ev_ts)),
+        "rows_label": float(len(label_ts)),
     })
 
     if len(main_ts) == 0 or len(label_ts) == 0:
@@ -159,6 +198,12 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
             "val_mae_night": _mae(held, val_part[night]),
             "val_mae_day": _mae(held, val_part[~night]),
             "val_mae_predict_zero": float(np.mean(np.abs(val_part["target"]))) if len(val_part) else float("nan"),
+        })
+
+    with logger.trace("diagnose"):
+        logger.log_metrics({
+            **_lag_correlations(val_part, "val_corr_dP_dtarget"),
+            **_lag_correlations(val_part[night].reset_index(drop=True), "val_corr_night"),
         })
 
     with logger.trace("fit"):
