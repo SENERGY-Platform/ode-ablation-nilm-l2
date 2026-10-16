@@ -5,8 +5,13 @@ and the EV socket's energy register -- and, as a training-only topic, the compre
 sub-meter's own power. The sub-meter is the label: it is read here and nowhere else,
 because the deployed operator never receives it.
 
-The fit runs in the driver: one year at 15 minutes is about 35 000 rows, which a
-gradient-boosted tree ensemble fits in seconds.
+Only heating-season buckets (local months October to April) become training rows.
+The compressor's behaviour outside the heating season -- rare runs, hot water only --
+and the site's summer base load are unlike the months the operator is evaluated on,
+and a model fitted to the whole year learns mostly from them.
+
+The fit runs in the driver: a heating season at 15 minutes is about 20 000 rows, which
+a gradient-boosted tree ensemble fits in seconds.
 
 Before the final fit the last VALIDATION of history is held out, the model fitted on
 what precedes it and scored there, and that score logged as val_mae. That is a check
@@ -39,6 +44,9 @@ import features as F
 TRAINING_WINDOW = datetime.timedelta(days=365)
 VALIDATION = datetime.timedelta(days=31)
 
+# Local months whose buckets become training rows.
+HEATING_MONTHS = (10, 11, 12, 1, 2, 3, 4)
+
 # A bucket is a training row only if the label and the main meter both cover it.
 MIN_LABEL_SAMPLES = 20
 MIN_MAIN_SAMPLES = 5
@@ -49,17 +57,15 @@ P_MIN, P_MAX = -5.0, 4500.0
 # Lags, in buckets, of the step-correlation diagnostic.
 DIAGNOSTIC_LAGS = range(-4, 5)
 
-# Small trees with large leaves. The first two runs fitted their own training year to
-# 454 W and January to 1 354 W: the compressor explains only about a fifth of the
-# variance in main-meter steps even at night, and a model with room for it learns the
-# rest -- other loads -- as if it were signal. A leaf of 300 buckets is about three
-# days of 15-minute rows, so a split has to hold across many days to be made at all.
+# The v1 settings. A smaller model (15 leaves, 300 per leaf, 300 iterations) was worse
+# on the training year, on January and on February alike, so the gap between the
+# in-sample and the hold-out score was not capacity.
 MODEL_PARAMS = dict(
     loss="absolute_error",
     learning_rate=0.05,
-    max_iter=300,
-    max_leaf_nodes=15,
-    min_samples_leaf=300,
+    max_iter=600,
+    max_leaf_nodes=63,
+    min_samples_leaf=30,
     l2_regularization=1.0,
     early_stopping=False,
     random_state=0,
@@ -96,8 +102,12 @@ def _series(frame, column):
     return F.to_seconds(frame["time"]), F.to_values(frame[column])
 
 
+def _local(buckets) -> pd.DatetimeIndex:
+    return pd.to_datetime(np.asarray(buckets, dtype=float), unit="s", utc=True).tz_convert(F.LOCAL_TZ)
+
+
 def _local_hour(buckets) -> np.ndarray:
-    local = pd.to_datetime(np.asarray(buckets, dtype=float), unit="s", utc=True).tz_convert(F.LOCAL_TZ)
+    local = _local(buckets)
     return (local.hour + local.minute / 60.0).to_numpy(dtype=float)
 
 
@@ -110,6 +120,7 @@ def build_table(main_ts, main_vs, ev_ts, ev_vs, label_ts, label_vs) -> pd.DataFr
     hi = F.bucket_of(np.nanmax(main_ts)) - (F.LOOKAHEAD_BUCKETS + 1) * F.BUCKET_S
     starts = labels.index.to_numpy(dtype=float)
     starts = starts[(starts >= lo) & (starts <= hi)]
+    starts = starts[np.isin(_local(starts).month, HEATING_MONTHS)]
     X = F.build_features(main_ts, main_vs, ev_ts, ev_vs, starts)
     X["bucket"] = starts
     X["target"] = labels.loc[starts, "mean"].to_numpy()
@@ -167,6 +178,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     logger.log_params({
         "training_window_days": TRAINING_WINDOW.days,
         "validation_days": VALIDATION.days,
+        "heating_months": ",".join(str(m) for m in HEATING_MONTHS),
         "context_buckets": F.CONTEXT_BUCKETS,
         "lookahead_buckets": F.LOOKAHEAD_BUCKETS,
         **{f"hgb_{k}": v for k, v in MODEL_PARAMS.items()},
