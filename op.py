@@ -1,46 +1,84 @@
-"""The operator: what it infers per message, and when it retrains.
+"""The operator: estimate the heat pump compressor's 15-minute mean power from the main meter.
 
-MLOperator is the machine-learning half of Operator Lib. It loads the model
-registered under this pipeline and operator from MLflow, calls infer() for every
-message that matches a selector, and calls train() when there is no model yet or
-when need_retraining() says so. Training runs on Ray.
+Inputs, by selector:
+  main  -- main_energy: the main meter's register obis_1_8_0_f, kWh on the primary
+           side (transformer factor 50 applied by the meter's own firmware).
+  ev    -- ev_energy: the EV charging socket's energy register, kWh. A covariate: the
+           socket draws about as much as the compressor and would otherwise be
+           mistaken for it.
 
-Three methods are yours. Everything else — Kafka, the model registry, the
-lifecycle — belongs to the library.
+Output: {"prediction": W}, one per 15-minute bucket, stamped with the bucket's start.
+An estimate is published once a main-meter sample has arrived LOOKAHEAD_BUCKETS
+after the bucket's end, because the features look that far ahead. Every bucket gets
+an estimate, including ones the model is unsure of.
+
+The compressor's own sub-meter is a training label only; it never reaches infer().
 """
 
+import bisect
 import datetime
 import typing
 
+import numpy as np
 from mlflow.pyfunc import PyFuncModel, PythonModel
 
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
+import features as F
 from training import train_model
 
 
 class CustomConfig(Config):
-    """Deployment configuration, typed.
+    # Retrain at most this often, in seconds. A training pass reads a year of three
+    # series, so weekly rather than daily.
+    retrain_after_s = 7 * 86400
 
-    The base Config already carries mlflow_url, ray_url and ts_conn. Anything
-    added here arrives from the operator's deployment config under the same name,
-    with this value as the default.
+
+# How much raw history the buffers keep behind the next bucket to be estimated.
+_KEEP_S = (F.CONTEXT_BUCKETS + 1) * F.BUCKET_S + 600
+
+
+def _prune(ts: typing.List[float], vs: typing.List[float], cutoff: float):
+    """Drop samples before cutoff, keeping what the register knots still need.
+
+    A knot sits where the register took a new value, at the midpoint with the sample
+    before it. So the run of equal values reaching up to the cutoff keeps its first
+    sample and that sample's predecessor, and the samples in between -- which are not
+    knots -- are dropped. The knots left are the ones training computed over the
+    full history.
     """
+    i = bisect.bisect_left(ts, cutoff)
+    if i < 3:
+        return ts, vs
+    j = i - 1
+    while j > 0 and vs[j - 1] == vs[i - 1]:
+        j -= 1
+    keep = sorted({max(j - 1, 0), j, i - 1})
+    return [ts[k] for k in keep] + ts[i:], [vs[k] for k in keep] + vs[i:]
 
-    # Retrain at most this often, in seconds. A day, so a deployment does not
-    # spend its life training.
-    retrain_after_s = 86400
+
+def _append(ts: typing.List[float], vs: typing.List[float], t: float, v: float):
+    if not ts or t > ts[-1]:
+        ts.append(t)
+        vs.append(v)
+    elif t == ts[-1]:
+        vs[-1] = v
+    else:
+        k = bisect.bisect_left(ts, t)
+        if k < len(ts) and ts[k] == t:
+            vs[k] = v
+        else:
+            ts.insert(k, t)
+            vs.insert(k, v)
 
 
 class Operator(MLOperator):
     configType = CustomConfig
 
-    # Which inputs this operator accepts. "args" are the mapping destinations the
-    # pipeline is configured with, and the name is what infer() receives as
-    # "selector", so one operator can treat several input shapes differently.
     selectors = [
-        Selector({"name": "value", "args": ["value"]}),
+        Selector({"name": "main", "args": ["main_energy"]}),
+        Selector({"name": "ev", "args": ["ev_energy"]}),
     ]
 
     def init(self, *args, **kwargs):
@@ -48,6 +86,11 @@ class Operator(MLOperator):
         # test window before it returns, so anything set after it is missing
         # during the replay and overwrites what train() just recorded.
         self.trained_at: typing.Optional[datetime.datetime] = None
+        self.main_t: typing.List[float] = []
+        self.main_v: typing.List[float] = []
+        self.ev_t: typing.List[float] = []
+        self.ev_v: typing.List[float] = []
+        self.next_bucket: typing.Optional[float] = None
         super().init(*args, **kwargs)
 
     def infer(
@@ -60,39 +103,51 @@ class Operator(MLOperator):
     ) -> typing.Tuple[
         typing.Optional[datetime.datetime], typing.Optional[typing.Any], typing.Optional[PythonModel]
     ]:
-        """Called for every message. Returns (result timestamp, result, new model).
+        t = timestamp.timestamp()
 
-        The result timestamp may be None, which means now; it is what lets a
-        forecast carry the time it is about rather than the time it was made. The
-        third element replaces the registered model and is almost always None —
-        return one only from an algorithm that genuinely updates per message.
-        """
-        value = data.get("value")
-        if value is None or model is None:
+        if selector == "ev":
+            value = data.get("ev_energy")
+            if value is not None:
+                _append(self.ev_t, self.ev_v, t, float(value))
             return None, None, None
 
-        prediction = model.predict({"timestamp": timestamp, "value": float(value)})
-        return None, {"prediction": prediction}, None
+        value = data.get("main_energy")
+        if value is None:
+            return None, None, None
+        _append(self.main_t, self.main_v, t, float(value))
+
+        if self.next_bucket is None:
+            # The bucket the first sample lands in has no start edge; begin after it.
+            self.next_bucket = float(F.bucket_of(t)) + F.BUCKET_S
+
+        ready_at = self.next_bucket + (1 + F.LOOKAHEAD_BUCKETS) * F.BUCKET_S + F.READY_MARGIN_S
+        if model is None or self.main_t[-1] < ready_at:
+            return None, None, None
+
+        start = self.next_bucket
+        self.next_bucket += F.BUCKET_S
+
+        X = F.build_features(
+            np.asarray(self.main_t), np.asarray(self.main_v),
+            np.asarray(self.ev_t), np.asarray(self.ev_v),
+            np.array([start]),
+        )
+        prediction = float(np.asarray(model.predict(X)).ravel()[0])
+
+        cutoff = self.next_bucket - _KEEP_S
+        self.main_t, self.main_v = _prune(self.main_t, self.main_v, cutoff)
+        self.ev_t, self.ev_v = _prune(self.ev_t, self.ev_v, cutoff)
+
+        bucket_time = datetime.datetime.fromtimestamp(start, tz=datetime.timezone.utc)
+        return bucket_time, {"prediction": prediction}, None
 
     def train(
         self, model: typing.Optional[PyFuncModel], logger: TrainMlflowLogger
     ) -> typing.Optional[PythonModel]:
-        """Called when there is no model, or when need_retraining() said so.
-
-        Runs inside a Ray session the library opened, with an MLflow run already
-        started — so params and metrics logged through "logger" land on the run
-        the resulting model is registered from.
-        """
         self.trained_at = datetime.datetime.now(datetime.timezone.utc)
         return train_model(logger)
 
     def need_retraining(self, model: typing.Optional[PyFuncModel]) -> bool:
-        """Called after every inference, so it has to be cheap.
-
-        Time-based to start with. A better policy watches the data — a drift in the
-        input distribution, or an error that stops falling — and that is a decision
-        to make with the profile in front of you rather than a default to inherit.
-        """
         if model is None:
             return True
         if self.trained_at is None:
