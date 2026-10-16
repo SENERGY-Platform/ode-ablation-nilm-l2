@@ -49,12 +49,17 @@ P_MIN, P_MAX = -5.0, 4500.0
 # Lags, in buckets, of the step-correlation diagnostic.
 DIAGNOSTIC_LAGS = range(-4, 5)
 
+# Small trees with large leaves. The first two runs fitted their own training year to
+# 454 W and January to 1 354 W: the compressor explains only about a fifth of the
+# variance in main-meter steps even at night, and a model with room for it learns the
+# rest -- other loads -- as if it were signal. A leaf of 300 buckets is about three
+# days of 15-minute rows, so a split has to hold across many days to be made at all.
 MODEL_PARAMS = dict(
     loss="absolute_error",
     learning_rate=0.05,
-    max_iter=600,
-    max_leaf_nodes=63,
-    min_samples_leaf=30,
+    max_iter=300,
+    max_leaf_nodes=15,
+    min_samples_leaf=300,
     l2_regularization=1.0,
     early_stopping=False,
     random_state=0,
